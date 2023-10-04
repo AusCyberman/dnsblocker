@@ -3,18 +3,16 @@ use diesel::{
     backend::Backend,
     deserialize::{FromSql, FromSqlRow},
     expression::AsExpression,
+    pg::Pg,
     prelude::{Associations, Identifiable, Insertable, Queryable},
     query_builder::AsChangeset,
     serialize::ToSql,
-    sql_types,
-    sqlite::Sqlite,
-    Selectable,
+    sql_types, Selectable,
 };
 use serde::{Serialize, Serializer};
 
 #[derive(Selectable, Queryable, Debug, PartialEq, Identifiable)]
 #[diesel(table_name = crate::schema::users)]
-#[diesel(check_for_backend(diesel::sqlite::Sqlite))]
 pub struct User {
     pub id: i32,
     pub name: String,
@@ -23,7 +21,6 @@ pub struct User {
 
 #[derive(Selectable, Queryable)]
 #[diesel(table_name = crate::schema::clients)]
-#[diesel(check_for_backend(diesel::sqlite::Sqlite))]
 #[diesel(belongs_to(User))]
 pub struct Client {
     pub id: i32,
@@ -33,7 +30,6 @@ pub struct Client {
 
 #[derive(Identifiable, Queryable, Selectable, Associations, Debug, PartialEq)]
 #[diesel(table_name = crate::schema::domain)]
-#[diesel(check_for_backend(diesel::sqlite::Sqlite))]
 #[diesel(belongs_to(User))]
 pub struct Domain {
     pub id: i32,
@@ -60,11 +56,11 @@ where
     }
 }
 
-impl FromSql<sql_types::Integer, Sqlite> for EndDuration
+impl FromSql<sql_types::Integer, Pg> for EndDuration
 where
-    i32: ToSql<sql_types::Integer, Sqlite>,
+    i32: ToSql<sql_types::Integer, Pg>,
 {
-    fn from_sql(bytes: <Sqlite as Backend>::RawValue<'_>) -> diesel::deserialize::Result<Self> {
+    fn from_sql(bytes: <Pg as Backend>::RawValue<'_>) -> diesel::deserialize::Result<Self> {
         Ok(EndDuration(chrono::Duration::milliseconds(
             i32::from_sql(bytes)? as i64,
         )))
@@ -92,7 +88,6 @@ impl Serialize for EndDuration {
     Clone,
 )]
 #[diesel(table_name = crate::schema::sessions)]
-#[diesel(check_for_backend(diesel::sqlite::Sqlite))]
 #[diesel(treat_none_as_null = true)]
 #[diesel(belongs_to(User))]
 pub struct Session {

@@ -1,14 +1,20 @@
+use std::env;
 use std::{net::SocketAddr, str::FromStr, sync::Arc};
 
 use axum::extract::{Path, State};
 use axum::response::{Html, IntoResponse};
 use axum::Json;
 use chrono::{NaiveDateTime, Utc};
+use diesel::connection::DefaultLoadingMode;
 use diesel::prelude::*;
-use diesel::{Connection, ExpressionMethods, QueryDsl, SqliteConnection};
+use diesel::{Connection, ExpressionMethods};
+use diesel_async::pooled_connection::deadpool::{self, Pool};
+use diesel_async::pooled_connection::AsyncDieselConnectionManager;
+use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use models::{Domain, EndDuration, Session, User};
 use schema::sessions;
 use tokio::{net::UdpSocket, select, sync::Mutex};
+use tokio_stream::StreamExt;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::EnvFilter;
 use trust_dns_resolver::error::{ResolveError, ResolveErrorKind};
@@ -62,7 +68,7 @@ impl Handler {
         Ok(())
     }
     async fn get_domains(&self, ip: String) -> Result<Vec<LowerName>, ServerError> {
-        let mut db = self.state.connection.lock().await;
+        let mut db = self.state.pool.get().await.unwrap();
         let now = chrono::Utc::now().naive_utc();
         let user: Vec<User> = schema::clients::table
             .inner_join(schema::users::table.inner_join(sessions::table))
@@ -72,13 +78,16 @@ impl Handler {
                     .and(schema::sessions::end_timestamp.gt(now)),
             )
             .select(User::as_select())
-            .load(&mut (*db))?;
-        Ok(Domain::belonging_to(&user)
+            .load(&mut db)
+            .await?;
+        Domain::belonging_to(&user)
             .select(Domain::as_select())
-            .load_iter::<Domain, _>(&mut (*db))
+            .load_stream::<Domain>(&mut (*db))
+            .await
             .unwrap()
             .map(|x| Ok(LowerName::new(&Name::from_str(&x?.domain_name).unwrap())))
-            .collect::<QueryResult<Vec<_>>>()?)
+            .collect::<Result<Vec<LowerName>, ServerError>>()
+            .await
     }
 }
 
@@ -132,21 +141,24 @@ pub enum ServerError {
     TrustDnsProto(#[from] trust_dns_resolver::proto::error::ProtoError),
     #[error("Trust DNS Resolve Error: {0}")]
     TrustDnsResolve(#[from] trust_dns_resolver::error::ResolveError),
+    #[error("Deadpool pool error: {0}")]
+    Deadpool(#[from] deadpool::PoolError),
 }
 
 struct ServerState {
-    connection: Mutex<SqliteConnection>,
+    pool: Pool<AsyncPgConnection>,
 }
 
 async fn pause(
     State(state): State<Arc<ServerState>>,
     Path(session_id): Path<u32>,
 ) -> impl IntoResponse {
-    let mut db = state.connection.lock().await;
+    let mut db = state.pool.get().await.unwrap();
     let mut session: Session = sessions::table
         .filter(sessions::id.eq(session_id as i32))
         .select(Session::as_select())
         .first(&mut (*db))
+        .await
         .unwrap();
     if let Some(timestamp) = session.end_timestamp {
         session.end_timestamp = None;
@@ -155,6 +167,7 @@ async fn pause(
             .filter(sessions::id.eq(session_id as i32))
             .set(session.clone())
             .execute(&mut (*db))
+            .await
             .unwrap();
     }
     Json(session)
@@ -163,11 +176,12 @@ async fn session(
     State(state): State<Arc<ServerState>>,
     Path(session_id): Path<u32>,
 ) -> impl IntoResponse {
-    let mut db = state.connection.lock().await;
+    let mut db = state.pool.get().await.unwrap();
     let session: Session = sessions::table
         .filter(sessions::id.eq(session_id as i32))
         .select(Session::as_select())
-        .first(&mut (*db))
+        .first(&mut db)
+        .await
         .unwrap();
     Json(session)
 }
@@ -176,11 +190,12 @@ async fn unpause(
     State(state): State<Arc<ServerState>>,
     Path(session_id): Path<u32>,
 ) -> impl IntoResponse {
-    let mut db = state.connection.lock().await;
+    let mut db = state.pool.get().await.unwrap();
     let mut session: Session = sessions::table
         .filter(sessions::id.eq(session_id as i32))
         .select(Session::as_select())
         .first(&mut (*db))
+        .await
         .unwrap();
     if let Some(EndDuration(diff)) = session.time_left {
         session.time_left = None;
@@ -190,17 +205,19 @@ async fn unpause(
             .filter(sessions::id.eq(session_id as i32))
             .set(session.clone())
             .execute(&mut (*db))
+            .await
             .unwrap();
     }
     Json(session)
 }
 async fn timers(State(state): State<Arc<ServerState>>) -> impl IntoResponse {
-    let mut db = state.connection.lock().await;
+    let mut db = state.pool.get().await.unwrap();
     let now = Utc::now().naive_utc();
     let sessions: Vec<Session> = sessions::table
         .filter(schema::sessions::end_timestamp.gt(now))
         .select(Session::as_select())
-        .load(&mut (*db))
+        .load(&mut db)
+        .await
         .unwrap();
     Html(format!(
         r#"
@@ -223,11 +240,17 @@ pub async fn main() -> Result<(), ServerError> {
         "192.168.1.26:53".parse().unwrap(),
         trust_dns_resolver::config::Protocol::Udp,
     ));
+    config.add_name_server(NameServerConfig::new(
+        "1.1.1.1:53".parse().unwrap(),
+        trust_dns_resolver::config::Protocol::Udp,
+    ));
     let resolver = AsyncResolver::tokio(config, ResolverOpts::default());
-    let connection = diesel::sqlite::SqliteConnection::establish("sqlite.db")?;
-    let state = Arc::new(ServerState {
-        connection: Mutex::new(connection),
-    });
+    // create a new connection pool with the default config
+    let config = AsyncDieselConnectionManager::<diesel_async::AsyncPgConnection>::new(
+        std::env::var("DATABASE_URL").unwrap(),
+    );
+    let pool = Pool::builder(config).build().unwrap();
+    let state = Arc::new(ServerState { pool });
     let handler = Handler {
         resolver,
         state: state.clone(),
@@ -241,8 +264,8 @@ pub async fn main() -> Result<(), ServerError> {
             .unwrap(),
     );
     let app = axum::Router::new()
-        .route("/session/:session_id", axum::routing::get(session))
-        .route("/session/:session_id/pause", axum::routing::get(pause))
+        .route("/sessions/:session_id", axum::routing::get(session))
+        .route("/sessions/:session_id/pause", axum::routing::get(pause))
         .route("/sessions/:session_id/unpause", axum::routing::get(unpause))
         .route("/timers", axum::routing::get(timers))
         .route("/", axum::routing::get({ "Woop" }))

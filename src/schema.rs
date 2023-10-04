@@ -2,33 +2,33 @@
 
 diesel::table! {
     clients (id) {
-        id -> Integer,
+        id -> Int4,
         block_all -> Bool,
         ip -> Text,
-        user_id -> Integer,
+        user_id -> Int4,
     }
 }
 
 diesel::table! {
     domain (id) {
-        id -> Integer,
+        id -> Int4,
         domain_name -> Text,
-        user_id -> Integer,
+        user_id -> Int4,
     }
 }
 
 diesel::table! {
     sessions (id) {
-        id -> Integer,
-        user_id -> Integer,
-        time_left -> Nullable<Integer>,
+        id -> Int4,
+        user_id -> Int4,
+        time_left -> Nullable<Int4>,
         end_timestamp -> Nullable<Timestamp>,
     }
 }
 
 diesel::table! {
     users (id) {
-        id -> Integer,
+        id -> Int4,
         name -> Text,
         username -> Text,
     }
